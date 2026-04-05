@@ -73,6 +73,7 @@ Error metric: sum of minimum distances from each rendered point to nearest targe
 **Controls:**
 - Number of circles (slider, 1 to max)
 - Animation speed
+- Trail fade (slider, 0% = no fade full trail, 80% default = faded at 80% back from tip, 100% = instant vanish trace)
 - Play / pause / reset
 - Optimization iterations (slider, 0 = pure FFT, up to ~1000)
 - Show/hide circles, show/hide trail

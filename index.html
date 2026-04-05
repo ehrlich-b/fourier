@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fourier</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0a0a0a;
+  color: #ccc;
+  font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+  font-size: 13px;
+  overflow: hidden;
+  width: 100vw;
+  height: 100vh;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+canvas {
+  position: absolute;
+  top: 0; left: 0;
+}
+
+#controls {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(10, 10, 10, 0.85);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px solid #222;
+  min-width: 200px;
+}
+
+#controls label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+#controls input[type="range"] {
+  flex: 1;
+  accent-color: #4a9eff;
+  max-width: 120px;
+}
+
+#controls button {
+  background: #1a1a1a;
+  color: #ccc;
+  border: 1px solid #333;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+#controls button:hover { background: #252525; border-color: #444; }
+#controls button.active { background: #1a3a5c; border-color: #4a9eff; color: #4a9eff; }
+
+.btn-row {
+  display: flex;
+  gap: 4px;
+}
+.btn-row button { flex: 1; }
+
+#info {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  z-index: 10;
+  color: #555;
+  font-size: 11px;
+}
+
+#prompt {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: #333;
+  font-size: 18px;
+  pointer-events: none;
+  text-align: center;
+  line-height: 1.6;
+}
+#prompt.hidden { display: none; }
+
+.slider-val {
+  min-width: 28px;
+  text-align: right;
+  color: #666;
+  font-size: 11px;
+}
+</style>
+</head>
+<body>
+
+<canvas id="mainCanvas"></canvas>
+
+<div id="controls">
+  <div class="btn-row">
+    <button id="btnDraw" class="active">Draw</button>
+    <button id="btnUpload">Upload</button>
+  </div>
+  <div class="btn-row" id="playbackControls" style="display:none">
+    <button id="btnPlay">Play</button>
+    <button id="btnPause">Pause</button>
+    <button id="btnReset">Reset</button>
+  </div>
+  <label id="circleControl" style="display:none">
+    Circles <input type="range" id="circleSlider" min="1" max="100" value="50">
+    <span class="slider-val" id="circleVal">50</span>
+  </label>
+  <label id="speedControl" style="display:none">
+    Speed <input type="range" id="speedSlider" min="1" max="200" value="50">
+    <span class="slider-val" id="speedVal">50</span>
+  </label>
+  <label id="fadeControl" style="display:none">
+    Fade <input type="range" id="fadeSlider" min="0" max="100" value="80">
+    <span class="slider-val" id="fadeVal">80%</span>
+  </label>
+  <label id="optimControl" style="display:none">
+    Optim <input type="range" id="optimSlider" min="0" max="1000" value="0" step="10">
+    <span class="slider-val" id="optimVal">0</span>
+  </label>
+  <button id="btnClear" style="display:none">Clear</button>
+</div>
+
+<div id="prompt">Draw something</div>
+<div id="info"></div>
+
+<input type="file" id="fileInput" accept="image/*" style="display:none">
+
+<script>
+// ============================================================
+// Canvas setup
+// ============================================================
+const canvas = document.getElementById('mainCanvas');
+const ctx = canvas.getContext('2d');
+const dpr = window.devicePixelRatio || 1;
+
+function resize() {
+  canvas.width = window.innerWidth * dpr;
+  canvas.height = window.innerHeight * dpr;
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ============================================================
+// State
+// ============================================================
+let mode = 'draw'; // 'draw' | 'animate'
+let drawingPoints = [];
+let isDrawing = false;
+let coefficients = []; // {freq, amp, phase, re, im}
+let numCircles = 50;
+let animSpeed = 50;
+let animTime = 0;
+let animPlaying = false;
+let trail = [];
+const MAX_TRAIL = 4000;
+let trailFade = 80; // 0 = no fade (full trail), 100 = instant vanish
+
+// ============================================================
+// UI wiring
+// ============================================================
+const $ = id => document.getElementById(id);
+
+$('btnDraw').addEventListener('click', () => enterDrawMode());
+$('btnUpload').addEventListener('click', () => $('fileInput').click());
+$('fileInput').addEventListener('change', handleFileUpload);
+
+$('btnPlay').addEventListener('click', () => { animPlaying = true; });
+$('btnPause').addEventListener('click', () => { animPlaying = false; });
+$('btnReset').addEventListener('click', () => { animTime = 0; trail = []; });
+$('btnClear').addEventListener('click', () => enterDrawMode());
+
+$('circleSlider').addEventListener('input', e => {
+  numCircles = parseInt(e.target.value);
+  $('circleVal').textContent = numCircles;
+  trail = []; animTime = 0;
+});
+$('speedSlider').addEventListener('input', e => {
+  animSpeed = parseInt(e.target.value);
+  $('speedVal').textContent = animSpeed;
+});
+$('fadeSlider').addEventListener('input', e => {
+  trailFade = parseInt(e.target.value);
+  $('fadeVal').textContent = trailFade + '%';
+});
+$('optimSlider').addEventListener('input', e => {
+  $('optimVal').textContent = e.target.value;
+  if (coefficients.length > 0) {
+    runOptimization(parseInt(e.target.value));
+  }
+});
+
+function showAnimControls(maxCircles) {
+  $('circleSlider').max = maxCircles;
+  numCircles = Math.min(numCircles, maxCircles);
+  $('circleSlider').value = numCircles;
+  $('circleVal').textContent = numCircles;
+  $('playbackControls').style.display = '';
+  $('circleControl').style.display = '';
+  $('speedControl').style.display = '';
+  $('fadeControl').style.display = '';
+  $('optimControl').style.display = '';
+  $('btnClear').style.display = '';
+  $('prompt').classList.add('hidden');
+}
+
+function hideAnimControls() {
+  $('playbackControls').style.display = 'none';
+  $('circleControl').style.display = 'none';
+  $('speedControl').style.display = 'none';
+  $('fadeControl').style.display = 'none';
+  $('optimControl').style.display = 'none';
+  $('btnClear').style.display = 'none';
+}
+
+function enterDrawMode() {
+  mode = 'draw';
+  drawingPoints = [];
+  coefficients = [];
+  trail = [];
+  animTime = 0;
+  animPlaying = false;
+  hideAnimControls();
+  $('prompt').classList.remove('hidden');
+  $('prompt').textContent = 'Draw something';
+  $('btnDraw').classList.add('active');
+  $('btnUpload').classList.remove('active');
+  $('optimSlider').value = 0;
+  $('optimVal').textContent = '0';
+}
+
+function enterAnimMode(points) {
+  const resampled = resamplePath(points, 1024);
+  rawCoefficients = computeDFT(resampled);
+  coefficients = rawCoefficients.slice();
+  optimIterations = 0;
+
+  mode = 'animate';
+  animTime = 0;
+  trail = [];
+  animPlaying = true;
+
+  numCircles = Math.min(Math.floor(coefficients.length / 2), 200);
+  showAnimControls(coefficients.length);
+  $('circleSlider').value = numCircles;
+  $('circleVal').textContent = numCircles;
+  $('btnDraw').classList.remove('active');
+}
+
+// ============================================================
+// Drawing input
+// ============================================================
+canvas.addEventListener('pointerdown', e => {
+  if (mode !== 'draw') return;
+  isDrawing = true;
+  drawingPoints = [];
+  drawingPoints.push({ x: e.clientX, y: e.clientY });
+  $('prompt').classList.add('hidden');
+});
+
+canvas.addEventListener('pointermove', e => {
+  if (!isDrawing) return;
+  drawingPoints.push({ x: e.clientX, y: e.clientY });
+});
+
+canvas.addEventListener('pointerup', () => {
+  if (!isDrawing) return;
+  isDrawing = false;
+  if (drawingPoints.length > 10) {
+    enterAnimMode(drawingPoints);
+  }
+});
+
+// ============================================================
+// Image upload
+// ============================================================
+function handleFileUpload(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const img = new Image();
+  img.onload = () => {
+    const points = extractEdgePoints(img);
+    if (points.length > 10) {
+      enterAnimMode(points);
+      $('btnUpload').classList.add('active');
+      $('btnDraw').classList.remove('active');
+    }
+  };
+  img.src = URL.createObjectURL(file);
+  e.target.value = '';
+}
+
+// ============================================================
+// Edge detection (Canny-lite)
+// ============================================================
+function extractEdgePoints(img) {
+  // Draw image to offscreen canvas, scaled to fit
+  const maxDim = 400;
+  const scale = Math.min(maxDim / img.width, maxDim / img.height, 1);
+  const w = Math.round(img.width * scale);
+  const h = Math.round(img.height * scale);
+
+  const oc = new OffscreenCanvas(w, h);
+  const octx = oc.getContext('2d');
+  octx.drawImage(img, 0, 0, w, h);
+  const imageData = octx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+
+  // Grayscale
+  const gray = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    gray[i] = 0.299 * data[i*4] + 0.587 * data[i*4+1] + 0.114 * data[i*4+2];
+  }
+
+  // Gaussian blur 3x3
+  const blurred = new Float32Array(w * h);
+  const kernel = [1,2,1,2,4,2,1,2,1];
+  for (let y = 1; y < h-1; y++) {
+    for (let x = 1; x < w-1; x++) {
+      let sum = 0;
+      for (let ky = -1; ky <= 1; ky++) {
+        for (let kx = -1; kx <= 1; kx++) {
+          sum += gray[(y+ky)*w + (x+kx)] * kernel[(ky+1)*3 + (kx+1)];
+        }
+      }
+      blurred[y*w+x] = sum / 16;
+    }
+  }
+
+  // Sobel gradients
+  const gx = new Float32Array(w * h);
+  const gy = new Float32Array(w * h);
+  const mag = new Float32Array(w * h);
+  const dir = new Float32Array(w * h);
+  for (let y = 1; y < h-1; y++) {
+    for (let x = 1; x < w-1; x++) {
+      const idx = y*w+x;
+      gx[idx] = -blurred[(y-1)*w+x-1] + blurred[(y-1)*w+x+1]
+               -2*blurred[y*w+x-1] + 2*blurred[y*w+x+1]
+               -blurred[(y+1)*w+x-1] + blurred[(y+1)*w+x+1];
+      gy[idx] = -blurred[(y-1)*w+x-1] -2*blurred[(y-1)*w+x]  -blurred[(y-1)*w+x+1]
+               +blurred[(y+1)*w+x-1] +2*blurred[(y+1)*w+x]  +blurred[(y+1)*w+x+1];
+      mag[idx] = Math.sqrt(gx[idx]*gx[idx] + gy[idx]*gy[idx]);
+      dir[idx] = Math.atan2(gy[idx], gx[idx]);
+    }
+  }
+
+  // Non-maximum suppression
+  const nms = new Float32Array(w * h);
+  for (let y = 1; y < h-1; y++) {
+    for (let x = 1; x < w-1; x++) {
+      const idx = y*w+x;
+      let angle = dir[idx] * 180 / Math.PI;
+      if (angle < 0) angle += 180;
+      let n1 = 0, n2 = 0;
+      if (angle < 22.5 || angle >= 157.5) { n1 = mag[y*w+x+1]; n2 = mag[y*w+x-1]; }
+      else if (angle < 67.5) { n1 = mag[(y-1)*w+x+1]; n2 = mag[(y+1)*w+x-1]; }
+      else if (angle < 112.5) { n1 = mag[(y-1)*w+x]; n2 = mag[(y+1)*w+x]; }
+      else { n1 = mag[(y-1)*w+x-1]; n2 = mag[(y+1)*w+x+1]; }
+      nms[idx] = (mag[idx] >= n1 && mag[idx] >= n2) ? mag[idx] : 0;
+    }
+  }
+
+  // Double threshold + hysteresis
+  let maxMag = 0;
+  for (let i = 0; i < nms.length; i++) if (nms[i] > maxMag) maxMag = nms[i];
+  const highT = maxMag * 0.15;
+  const lowT = highT * 0.4;
+
+  const edge = new Uint8Array(w * h);
+  // Strong edges
+  for (let i = 0; i < w*h; i++) {
+    if (nms[i] >= highT) edge[i] = 2;
+    else if (nms[i] >= lowT) edge[i] = 1;
+  }
+  // Hysteresis: promote weak edges connected to strong
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let y = 1; y < h-1; y++) {
+      for (let x = 1; x < w-1; x++) {
+        if (edge[y*w+x] === 1) {
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              if (edge[(y+dy)*w+x+dx] === 2) {
+                edge[y*w+x] = 2;
+                changed = true;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Collect edge points
+  const edgePoints = [];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (edge[y*w+x] === 2) edgePoints.push({ x, y });
+    }
+  }
+
+  if (edgePoints.length === 0) return [];
+
+  // Order points: greedy nearest-neighbor
+  const ordered = orderPoints(edgePoints);
+
+  // Center and scale to screen
+  const cx = window.innerWidth / 2;
+  const cy = window.innerHeight / 2;
+  const drawScale = Math.min(window.innerWidth, window.innerHeight) * 0.7 / Math.max(w, h);
+  const ox = cx - (w * drawScale) / 2;
+  const oy = cy - (h * drawScale) / 2;
+
+  return ordered.map(p => ({
+    x: ox + p.x * drawScale,
+    y: oy + p.y * drawScale
+  }));
+}
+
+// ============================================================
+// Path ordering (greedy nearest-neighbor)
+// ============================================================
+function orderPoints(points) {
+  const n = points.length;
+  if (n <= 2) return points;
+
+  // Subsample if too many points for O(n^2) greedy
+  let pts = points;
+  if (n > 3000) {
+    const step = Math.ceil(n / 3000);
+    pts = points.filter((_, i) => i % step === 0);
+  }
+
+  const used = new Uint8Array(pts.length);
+  const order = [0];
+  used[0] = 1;
+
+  for (let i = 1; i < pts.length; i++) {
+    const last = pts[order[order.length - 1]];
+    let bestD = Infinity, bestJ = 0;
+    for (let j = 0; j < pts.length; j++) {
+      if (used[j]) continue;
+      const dx = pts[j].x - last.x, dy = pts[j].y - last.y;
+      const d = dx*dx + dy*dy;
+      if (d < bestD) { bestD = d; bestJ = j; }
+    }
+    order.push(bestJ);
+    used[bestJ] = 1;
+  }
+
+  return order.map(i => pts[i]);
+}
+
+// ============================================================
+// Path resampling
+// ============================================================
+function resamplePath(points, n) {
+  if (points.length < 2) return points;
+
+  // Compute cumulative arc length
+  const lens = [0];
+  for (let i = 1; i < points.length; i++) {
+    const dx = points[i].x - points[i-1].x;
+    const dy = points[i].y - points[i-1].y;
+    lens.push(lens[i-1] + Math.sqrt(dx*dx + dy*dy));
+  }
+  const totalLen = lens[lens.length - 1];
+  if (totalLen === 0) return points.slice(0, n);
+
+  // Close the path: add distance from last to first
+  const closeDx = points[0].x - points[points.length-1].x;
+  const closeDy = points[0].y - points[points.length-1].y;
+  const closeDist = Math.sqrt(closeDx*closeDx + closeDy*closeDy);
+  const totalClosed = totalLen + closeDist;
+
+  const result = [];
+  for (let i = 0; i < n; i++) {
+    const target = (i / n) * totalClosed;
+
+    if (target <= totalLen) {
+      // Interpolate along the original path
+      let j = 1;
+      while (j < lens.length - 1 && lens[j] < target) j++;
+      const seg = lens[j] - lens[j-1];
+      const t = seg > 0 ? (target - lens[j-1]) / seg : 0;
+      result.push({
+        x: points[j-1].x + t * (points[j].x - points[j-1].x),
+        y: points[j-1].y + t * (points[j].y - points[j-1].y)
+      });
+    } else {
+      // Interpolate closing segment
+      const t = (target - totalLen) / closeDist;
+      result.push({
+        x: points[points.length-1].x + t * closeDx,
+        y: points[points.length-1].y + t * closeDy
+      });
+    }
+  }
+  return result;
+}
+
+// ============================================================
+// DFT
+// ============================================================
+function computeDFT(points) {
+  const N = points.length;
+  const result = [];
+  // Center the path
+  let cx = 0, cy = 0;
+  for (const p of points) { cx += p.x; cy += p.y; }
+  cx /= N; cy /= N;
+
+  for (let k = 0; k < N; k++) {
+    let re = 0, im = 0;
+    for (let n = 0; n < N; n++) {
+      const angle = (2 * Math.PI * k * n) / N;
+      re += (points[n].x - cx) * Math.cos(angle) + (points[n].y - cy) * Math.sin(angle);
+      im += (points[n].y - cy) * Math.cos(angle) - (points[n].x - cx) * Math.sin(angle);
+    }
+    re /= N;
+    im /= N;
+    const amp = Math.sqrt(re*re + im*im);
+    const phase = Math.atan2(im, re);
+    // Map frequency: 0, 1, -1, 2, -2, ...
+    let freq;
+    if (k === 0) freq = 0;
+    else if (k <= N/2) freq = k;
+    else freq = k - N;
+    result.push({ freq, amp, phase, re, im });
+  }
+
+  // Sort by amplitude descending
+  result.sort((a, b) => b.amp - a.amp);
+  return result;
+}
+
+// Store raw coefficients for optimization
+let rawCoefficients = [];
+let optimIterations = 0;
+
+// ============================================================
+// Optimization: gradient descent on amplitudes & phases
+// ============================================================
+function runOptimization(targetIter) {
+  if (targetIter <= optimIterations) {
+    // Reset to raw and re-run up to targetIter
+    coefficients = rawCoefficients.map(c => ({ ...c }));
+    optimIterations = 0;
+  }
+
+  const itersToRun = targetIter - optimIterations;
+  if (itersToRun <= 0) return;
+
+  // Get the target points from raw coefficients (use all of them as ground truth)
+  const N = 512;
+  const targetPoints = synthesizePath(rawCoefficients, rawCoefficients.length, N);
+
+  // Work on the active subset
+  const active = coefficients.slice(0, Math.min(numCircles, coefficients.length));
+  const lr = 0.001;
+
+  for (let iter = 0; iter < itersToRun; iter++) {
+    // Compute current path with active coefficients
+    const current = synthesizePath(active, active.length, N);
+
+    // Compute Chamfer-like gradient: for each current point, find nearest target point
+    for (let ci = 0; ci < active.length; ci++) {
+      let gradAmp = 0, gradPhase = 0;
+      const c = active[ci];
+
+      for (let i = 0; i < N; i++) {
+        const t = i / N;
+        const angle = 2 * Math.PI * c.freq * t + c.phase;
+
+        // Find nearest target point
+        let minD = Infinity, nearIdx = 0;
+        for (let j = 0; j < N; j++) {
+          const dx = current[i].x - targetPoints[j].x;
+          const dy = current[i].y - targetPoints[j].y;
+          const d = dx*dx + dy*dy;
+          if (d < minD) { minD = d; nearIdx = j; }
+        }
+
+        const errX = current[i].x - targetPoints[nearIdx].x;
+        const errY = current[i].y - targetPoints[nearIdx].y;
+
+        // d(x)/d(amp) = cos(angle), d(y)/d(amp) = sin(angle)
+        gradAmp += errX * Math.cos(angle) + errY * Math.sin(angle);
+        // d(x)/d(phase) = -amp*sin(angle), d(y)/d(phase) = amp*cos(angle)
+        gradPhase += errX * (-c.amp * Math.sin(angle)) + errY * (c.amp * Math.cos(angle));
+      }
+
+      gradAmp /= N;
+      gradPhase /= N;
+
+      c.amp -= lr * gradAmp;
+      c.phase -= lr * gradPhase;
+      if (c.amp < 0) c.amp = 0;
+      c.re = c.amp * Math.cos(c.phase);
+      c.im = c.amp * Math.sin(c.phase);
+    }
+
+    // Write back
+    for (let i = 0; i < active.length; i++) {
+      coefficients[i] = active[i];
+    }
+  }
+
+  optimIterations = targetIter;
+  trail = [];
+  animTime = 0;
+}
+
+// ============================================================
+// Synthesize path from coefficients
+// ============================================================
+function synthesizePath(coeffs, n, numPoints) {
+  const points = [];
+  const useN = Math.min(n, coeffs.length);
+  for (let i = 0; i < numPoints; i++) {
+    const t = i / numPoints;
+    let x = 0, y = 0;
+    for (let j = 0; j < useN; j++) {
+      const c = coeffs[j];
+      const angle = 2 * Math.PI * c.freq * t + c.phase;
+      x += c.amp * Math.cos(angle);
+      y += c.amp * Math.sin(angle);
+    }
+    points.push({ x, y });
+  }
+  return points;
+}
+
+// ============================================================
+// Epicycle computation at time t
+// ============================================================
+function computeEpicycles(t, n) {
+  const useN = Math.min(n, coefficients.length);
+  const circles = [];
+  let x = 0, y = 0;
+
+  // Find center offset (from the drawing's center)
+  const pts = drawingPoints.length > 0 ? drawingPoints : [];
+  let cx = window.innerWidth / 2, cy = window.innerHeight / 2;
+  if (pts.length > 0) {
+    cx = 0; cy = 0;
+    for (const p of pts) { cx += p.x; cy += p.y; }
+    cx /= pts.length; cy /= pts.length;
+  }
+
+  for (let i = 0; i < useN; i++) {
+    const c = coefficients[i];
+    const angle = 2 * Math.PI * c.freq * t + c.phase;
+    const px = x, py = y;
+    x += c.amp * Math.cos(angle);
+    y += c.amp * Math.sin(angle);
+    circles.push({
+      cx: px + cx, cy: py + cy,
+      r: c.amp,
+      x: x + cx, y: y + cy
+    });
+  }
+
+  return { circles, tipX: x + cx, tipY: y + cy };
+}
+
+// ============================================================
+// Render loop
+// ============================================================
+let lastTime = 0;
+
+function render(timestamp) {
+  const dt = lastTime ? (timestamp - lastTime) / 1000 : 0;
+  lastTime = timestamp;
+
+  ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+  if (mode === 'draw' && isDrawing && drawingPoints.length > 1) {
+    // Draw the current stroke
+    ctx.beginPath();
+    ctx.moveTo(drawingPoints[0].x, drawingPoints[0].y);
+    for (let i = 1; i < drawingPoints.length; i++) {
+      ctx.lineTo(drawingPoints[i].x, drawingPoints[i].y);
+    }
+    ctx.strokeStyle = '#4a9eff';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  if (mode === 'animate' && coefficients.length > 0) {
+    if (animPlaying) {
+      animTime += dt * (animSpeed / 50);
+      if (animTime >= 1) animTime -= 1;
+    }
+
+    const { circles, tipX, tipY } = computeEpicycles(animTime, numCircles);
+
+    // Draw circles
+    ctx.globalAlpha = 0.25;
+    for (const c of circles) {
+      ctx.beginPath();
+      ctx.arc(c.cx, c.cy, c.r, 0, 2 * Math.PI);
+      ctx.strokeStyle = '#335577';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      // Radius line
+      ctx.beginPath();
+      ctx.moveTo(c.cx, c.cy);
+      ctx.lineTo(c.x, c.y);
+      ctx.strokeStyle = '#4477aa';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // Trail
+    if (animPlaying) {
+      trail.push({ x: tipX, y: tipY });
+      if (trail.length > MAX_TRAIL) trail.shift();
+    }
+
+    if (trail.length > 1) {
+      if (trailFade === 0) {
+        // No fade: draw entire trail at full opacity
+        ctx.beginPath();
+        ctx.moveTo(trail[0].x, trail[0].y);
+        for (let i = 1; i < trail.length; i++) {
+          ctx.lineTo(trail[i].x, trail[i].y);
+        }
+        ctx.strokeStyle = '#4a9eff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      } else {
+        // Fade: older segments fade out
+        // trailFade=80 means fully faded at 80% back from the tip
+        // trailFade=100 means only the very tip is visible
+        const fadeLen = Math.max(1, Math.floor(trail.length * (1 - trailFade / 100)));
+        const startIdx = Math.max(0, trail.length - fadeLen);
+        const visibleLen = trail.length - startIdx;
+
+        // Batch segments by alpha to reduce draw calls (16 alpha buckets)
+        const BUCKETS = 16;
+        for (let b = 0; b < BUCKETS; b++) {
+          const segStart = startIdx + Math.floor((b / BUCKETS) * visibleLen);
+          const segEnd = startIdx + Math.floor(((b + 1) / BUCKETS) * visibleLen);
+          if (segEnd <= segStart + 1) continue;
+
+          const alpha = (b + 1) / BUCKETS;
+          ctx.globalAlpha = alpha;
+          ctx.beginPath();
+          ctx.moveTo(trail[segStart].x, trail[segStart].y);
+          for (let i = segStart + 1; i < segEnd; i++) {
+            ctx.lineTo(trail[i].x, trail[i].y);
+          }
+          ctx.strokeStyle = '#4a9eff';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // Tip dot
+    ctx.beginPath();
+    ctx.arc(tipX, tipY, 3, 0, 2 * Math.PI);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+
+    // Info
+    $('info').textContent = `circles: ${Math.min(numCircles, coefficients.length)} / ${coefficients.length}  |  t: ${animTime.toFixed(3)}  |  optim: ${optimIterations}`;
+  }
+
+  requestAnimationFrame(render);
+}
+
+requestAnimationFrame(render);
+
+// ============================================================
+// URL hash: decode coefficients on load
+// ============================================================
+function tryLoadFromHash() {
+  const hash = location.hash.slice(1);
+  if (!hash) return;
+
+  // Human-readable: h=f:a:p,f:a:p,...
+  if (hash.startsWith('h=')) {
+    const parts = hash.slice(2).split(',');
+    const coeffs = parts.map(s => {
+      const [f, a, p] = s.split(':').map(Number);
+      return {
+        freq: f, amp: a, phase: p,
+        re: a * Math.cos(p), im: a * Math.sin(p)
+      };
+    }).filter(c => !isNaN(c.freq));
+
+    if (coeffs.length > 0) {
+      coefficients = coeffs;
+      rawCoefficients = coeffs.map(c => ({ ...c }));
+      optimIterations = 0;
+      mode = 'animate';
+      animTime = 0;
+      trail = [];
+      animPlaying = true;
+      // Fake center to screen center
+      drawingPoints = [{ x: window.innerWidth/2, y: window.innerHeight/2 }];
+      numCircles = coefficients.length;
+      showAnimControls(coefficients.length);
+    }
+  }
+  // TODO: compressed binary format c=...
+}
+
+tryLoadFromHash();
+window.addEventListener('hashchange', tryLoadFromHash);
+</script>
+</body>
+</html>
