@@ -316,6 +316,10 @@ function enterAnimMode(points, isImage) {
   const dftSize = isImage ? 4096 : 1024;
   const resampled = resamplePath(points, dftSize);
   originalPath = resampled.slice();
+  // Compute centroid (same one DFT will subtract)
+  dftCenterX = 0; dftCenterY = 0;
+  for (const p of resampled) { dftCenterX += p.x; dftCenterY += p.y; }
+  dftCenterX /= resampled.length; dftCenterY /= resampled.length;
   rawCoefficients = computeDFT(resampled);
   coefficients = rawCoefficients.slice();
 
@@ -830,6 +834,7 @@ function computeDFT(points) {
 }
 
 let rawCoefficients = [];
+let dftCenterX = 0, dftCenterY = 0; // centroid subtracted by DFT
 
 // ============================================================
 // Epicycle computation at time t
@@ -838,15 +843,7 @@ function computeEpicycles(t, n) {
   const useN = Math.min(n, coefficients.length);
   const circles = [];
   let x = 0, y = 0;
-
-  // Find center offset (from the drawing's center)
-  const pts = drawingPoints.length > 0 ? drawingPoints : [];
-  let cx = window.innerWidth / 2, cy = window.innerHeight / 2;
-  if (pts.length > 0) {
-    cx = 0; cy = 0;
-    for (const p of pts) { cx += p.x; cy += p.y; }
-    cx /= pts.length; cy /= pts.length;
-  }
+  const cx = dftCenterX, cy = dftCenterY;
 
   for (let i = 0; i < useN; i++) {
     const c = coefficients[i];
@@ -1192,7 +1189,8 @@ function loadCoefficients(coeffs) {
   animTime = 0;
   trail = [];
   animPlaying = true;
-  drawingPoints = [{ x: window.innerWidth / 2, y: window.innerHeight / 2 }];
+  dftCenterX = window.innerWidth / 2;
+  dftCenterY = window.innerHeight / 2;
   numCircles = coefficients.length;
   showAnimControls(coefficients.length);
 }
