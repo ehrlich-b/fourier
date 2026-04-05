@@ -128,12 +128,8 @@ canvas {
     <span class="slider-val" id="speedVal">50</span>
   </label>
   <label id="fadeControl" style="display:none">
-    Fade <input type="range" id="fadeSlider" min="0" max="100" value="80">
-    <span class="slider-val" id="fadeVal">80%</span>
-  </label>
-  <label id="optimControl" style="display:none">
-    Optim <input type="range" id="optimSlider" min="0" max="1000" value="0" step="10">
-    <span class="slider-val" id="optimVal">0</span>
+    Fade <input type="range" id="fadeSlider" min="0" max="100" value="50">
+    <span class="slider-val" id="fadeVal">50%</span>
   </label>
   <div class="btn-row" id="presetRow">
     <select id="presetSelect" style="flex:1;background:#1a1a1a;color:#ccc;border:1px solid #333;border-radius:4px;padding:5px;font-family:inherit;font-size:12px;min-height:32px">
@@ -188,7 +184,7 @@ let animTime = 0;
 let animPlaying = false;
 let trail = [];
 const MAX_TRAIL = 4000;
-let trailFade = 80; // 0 = no fade (full trail), 100 = instant vanish
+let trailFade = 50; // 0 = no fade (full opacity), 100 = oldest fully transparent
 let showOverlay = false;
 let showSpectrum = false;
 let originalPath = []; // resampled original path for comparison overlay
@@ -251,22 +247,6 @@ $('fadeSlider').addEventListener('input', e => {
   trailFade = parseInt(e.target.value);
   $('fadeVal').textContent = trailFade + '%';
 });
-$('optimSlider').addEventListener('input', e => {
-  $('optimVal').textContent = e.target.value;
-  if (coefficients.length > 0) {
-    const target = parseInt(e.target.value);
-    if (target > 100) {
-      $('processing').textContent = 'Optimizing...';
-      $('processing').classList.remove('hidden');
-      setTimeout(() => {
-        runOptimization(target);
-        $('processing').classList.add('hidden');
-      }, 20);
-    } else {
-      runOptimization(target);
-    }
-  }
-});
 
 function showAnimControls(maxCircles) {
   $('circleSlider').max = maxCircles;
@@ -277,7 +257,6 @@ function showAnimControls(maxCircles) {
   $('circleControl').style.display = '';
   $('speedControl').style.display = '';
   $('fadeControl').style.display = '';
-  $('optimControl').style.display = '';
   $('btnSpectrum').style.display = '';
   $('btnOverlay').style.display = '';
   $('btnCopyLink').style.display = '';
@@ -290,7 +269,6 @@ function hideAnimControls() {
   $('circleControl').style.display = 'none';
   $('speedControl').style.display = 'none';
   $('fadeControl').style.display = 'none';
-  $('optimControl').style.display = 'none';
   $('btnSpectrum').style.display = 'none';
   $('btnOverlay').style.display = 'none';
   $('btnCopyLink').style.display = 'none';
@@ -316,8 +294,6 @@ function enterDrawMode() {
   $('btnOverlay').textContent = 'Show Original';
   $('btnOverlay').classList.remove('active');
   $('btnSpectrum').classList.remove('active');
-  $('optimSlider').value = 0;
-  $('optimVal').textContent = '0';
 }
 
 function enterAnimMode(points) {
@@ -325,7 +301,6 @@ function enterAnimMode(points) {
   originalPath = resampled.slice();
   rawCoefficients = computeDFT(resampled);
   coefficients = rawCoefficients.slice();
-  optimIterations = 0;
 
   mode = 'animate';
   animTime = 0;
@@ -523,18 +498,18 @@ function extractEdgePoints(img) {
     gray[i] = 0.299 * data[i*4] + 0.587 * data[i*4+1] + 0.114 * data[i*4+2];
   }
 
-  // Gaussian blur 3x3
+  // Gaussian blur 5x5 (sigma ~1.4)
   const blurred = new Float32Array(w * h);
-  const kernel = [1,2,1,2,4,2,1,2,1];
-  for (let y = 1; y < h-1; y++) {
-    for (let x = 1; x < w-1; x++) {
+  const k5 = [2,4,5,4,2, 4,9,12,9,4, 5,12,15,12,5, 4,9,12,9,4, 2,4,5,4,2];
+  for (let y = 2; y < h-2; y++) {
+    for (let x = 2; x < w-2; x++) {
       let sum = 0;
-      for (let ky = -1; ky <= 1; ky++) {
-        for (let kx = -1; kx <= 1; kx++) {
-          sum += gray[(y+ky)*w + (x+kx)] * kernel[(ky+1)*3 + (kx+1)];
+      for (let ky = -2; ky <= 2; ky++) {
+        for (let kx = -2; kx <= 2; kx++) {
+          sum += gray[(y+ky)*w + (x+kx)] * k5[(ky+2)*5 + (kx+2)];
         }
       }
-      blurred[y*w+x] = sum / 16;
+      blurred[y*w+x] = sum / 159;
     }
   }
 
@@ -573,9 +548,11 @@ function extractEdgePoints(img) {
   }
 
   // Double threshold + hysteresis
-  let maxMag = 0;
-  for (let i = 0; i < nms.length; i++) if (nms[i] > maxMag) maxMag = nms[i];
-  const highT = maxMag * 0.15;
+  // Percentile-based thresholds for consistent results across image types
+  const nonZeroMags = [];
+  for (let i = 0; i < nms.length; i++) if (nms[i] > 0) nonZeroMags.push(nms[i]);
+  nonZeroMags.sort((a, b) => a - b);
+  const highT = nonZeroMags.length > 0 ? nonZeroMags[Math.floor(nonZeroMags.length * 0.85)] : 1;
   const lowT = highT * 0.4;
 
   const edge = new Uint8Array(w * h);
@@ -791,124 +768,7 @@ function computeDFT(points) {
   return result;
 }
 
-// Store raw coefficients for optimization
 let rawCoefficients = [];
-let optimIterations = 0;
-
-// ============================================================
-// Optimization: gradient descent on amplitudes & phases
-// ============================================================
-function runOptimization(targetIter) {
-  if (targetIter <= optimIterations) {
-    // Reset to raw and re-run up to targetIter
-    coefficients = rawCoefficients.map(c => ({ ...c }));
-    optimIterations = 0;
-  }
-
-  const itersToRun = targetIter - optimIterations;
-  if (itersToRun <= 0) return;
-
-  // Get the target points from raw coefficients (use all of them as ground truth)
-  const N = 512;
-  const targetPoints = synthesizePath(rawCoefficients, rawCoefficients.length, N);
-
-  // Work on the active subset
-  const active = coefficients.slice(0, Math.min(numCircles, coefficients.length));
-  const lr = 0.001;
-
-  for (let iter = 0; iter < itersToRun; iter++) {
-    // Compute current path with active coefficients
-    const current = synthesizePath(active, active.length, N);
-
-    // Compute Chamfer-like gradient: for each current point, find nearest target point
-    for (let ci = 0; ci < active.length; ci++) {
-      let gradAmp = 0, gradPhase = 0;
-      const c = active[ci];
-
-      for (let i = 0; i < N; i++) {
-        const t = i / N;
-        const angle = 2 * Math.PI * c.freq * t + c.phase;
-
-        // Find nearest target point
-        let minD = Infinity, nearIdx = 0;
-        for (let j = 0; j < N; j++) {
-          const dx = current[i].x - targetPoints[j].x;
-          const dy = current[i].y - targetPoints[j].y;
-          const d = dx*dx + dy*dy;
-          if (d < minD) { minD = d; nearIdx = j; }
-        }
-
-        const errX = current[i].x - targetPoints[nearIdx].x;
-        const errY = current[i].y - targetPoints[nearIdx].y;
-
-        // d(x)/d(amp) = cos(angle), d(y)/d(amp) = sin(angle)
-        gradAmp += errX * Math.cos(angle) + errY * Math.sin(angle);
-        // d(x)/d(phase) = -amp*sin(angle), d(y)/d(phase) = amp*cos(angle)
-        gradPhase += errX * (-c.amp * Math.sin(angle)) + errY * (c.amp * Math.cos(angle));
-      }
-
-      gradAmp /= N;
-      gradPhase /= N;
-
-      c.amp -= lr * gradAmp;
-      c.phase -= lr * gradPhase;
-      if (c.amp < 0) c.amp = 0;
-      c.re = c.amp * Math.cos(c.phase);
-      c.im = c.amp * Math.sin(c.phase);
-    }
-
-    // Frequency swapping every 50 iterations: try replacing weakest active
-    // coefficient with an unused frequency from the full set
-    if ((optimIterations + iter + 1) % 50 === 0 && active.length > 2) {
-      const currentErr = chamferError(current, targetPoints);
-      // Find weakest active coefficient (skip DC term at freq 0)
-      let weakIdx = -1, weakAmp = Infinity;
-      for (let ci = 0; ci < active.length; ci++) {
-        if (active[ci].freq === 0) continue;
-        if (active[ci].amp < weakAmp) { weakAmp = active[ci].amp; weakIdx = ci; }
-      }
-      if (weakIdx >= 0) {
-        // Find unused frequencies
-        const activeFreqs = new Set(active.map(c => c.freq));
-        const candidates = rawCoefficients.filter(c => !activeFreqs.has(c.freq));
-        // Try top 5 unused by raw amplitude
-        const topCandidates = candidates.slice(0, 5);
-        let bestSwap = null, bestErr = currentErr;
-        const saved = active[weakIdx];
-        for (const cand of topCandidates) {
-          active[weakIdx] = { ...cand };
-          const trial = synthesizePath(active, active.length, N);
-          const err = chamferError(trial, targetPoints);
-          if (err < bestErr) { bestErr = err; bestSwap = { ...cand }; }
-        }
-        active[weakIdx] = bestSwap || saved;
-      }
-    }
-
-    // Write back
-    for (let i = 0; i < active.length; i++) {
-      coefficients[i] = active[i];
-    }
-  }
-
-  optimIterations = targetIter;
-  trail = [];
-  animTime = 0;
-}
-
-function chamferError(pathA, pathB) {
-  let total = 0;
-  for (let i = 0; i < pathA.length; i++) {
-    let minD = Infinity;
-    for (let j = 0; j < pathB.length; j++) {
-      const dx = pathA[i].x - pathB[j].x, dy = pathA[i].y - pathB[j].y;
-      const d = dx * dx + dy * dy;
-      if (d < minD) minD = d;
-    }
-    total += minD;
-  }
-  return total;
-}
 
 // ============================================================
 // Synthesize path from coefficients
@@ -1042,8 +902,10 @@ function render(timestamp) {
     }
 
     if (trail.length > 1) {
-      if (trailFade === 0) {
-        // No fade: draw entire trail at full opacity
+      // minAlpha: fade=0 -> 1.0 (no fade), fade=100 -> 0 (oldest invisible)
+      // Tip (newest) is always 1.0 alpha
+      const minAlpha = 1 - trailFade / 100;
+      if (minAlpha >= 1) {
         ctx.beginPath();
         ctx.moveTo(trail[0].x, trail[0].y);
         for (let i = 1; i < trail.length; i++) {
@@ -1053,21 +915,12 @@ function render(timestamp) {
         ctx.lineWidth = 2;
         ctx.stroke();
       } else {
-        // Fade: older segments fade out
-        // trailFade=80 means fully faded at 80% back from the tip
-        // trailFade=100 means only the very tip is visible
-        const fadeLen = Math.max(1, Math.floor(trail.length * (1 - trailFade / 100)));
-        const startIdx = Math.max(0, trail.length - fadeLen);
-        const visibleLen = trail.length - startIdx;
-
-        // Batch segments by alpha to reduce draw calls (16 alpha buckets)
         const BUCKETS = 16;
         for (let b = 0; b < BUCKETS; b++) {
-          const segStart = startIdx + Math.floor((b / BUCKETS) * visibleLen);
-          const segEnd = startIdx + Math.floor(((b + 1) / BUCKETS) * visibleLen);
+          const segStart = Math.floor((b / BUCKETS) * trail.length);
+          const segEnd = Math.floor(((b + 1) / BUCKETS) * trail.length);
           if (segEnd <= segStart + 1) continue;
-
-          const alpha = (b + 1) / BUCKETS;
+          const alpha = minAlpha + (1 - minAlpha) * ((b + 1) / BUCKETS);
           ctx.globalAlpha = alpha;
           ctx.beginPath();
           ctx.moveTo(trail[segStart].x, trail[segStart].y);
@@ -1122,7 +975,7 @@ function render(timestamp) {
     }
 
     // Info
-    $('info').textContent = `circles: ${Math.min(numCircles, coefficients.length)} / ${coefficients.length}  |  t: ${animTime.toFixed(3)}  |  optim: ${optimIterations}`;
+    $('info').textContent = `circles: ${Math.min(numCircles, coefficients.length)} / ${coefficients.length}  |  t: ${animTime.toFixed(3)}`;
   }
 
   requestAnimationFrame(render);
@@ -1235,7 +1088,6 @@ function loadCoefficients(coeffs) {
   if (coeffs.length === 0) return;
   coefficients = coeffs;
   rawCoefficients = coeffs.map(c => ({ ...c }));
-  optimIterations = 0;
   mode = 'animate';
   animTime = 0;
   trail = [];

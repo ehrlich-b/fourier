@@ -19,11 +19,8 @@
 - [x] Path ordering: 2-opt local improvement
 - [x] Point resampling (uniform arc-length, closed path)
 
-## Phase 3: Optimization Loop [DONE]
-- [x] Chamfer distance error metric
-- [x] Gradient descent on coefficient amplitudes + phases
-- [x] Frequency swapping (try alternative freqs for low-contributors)
-- [x] Iteration count slider with live progress
+## Phase 3: Optimization Loop [REMOVED]
+- Removed: FFT truncation already gives good results, optimization was O(n^2) and hung the browser
 - [x] Comparison overlay (original vs reconstructed)
 
 ## Phase 4: Sharing [DONE]
