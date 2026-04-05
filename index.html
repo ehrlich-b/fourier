@@ -120,7 +120,7 @@ canvas {
     <button id="btnReset">Reset</button>
   </div>
   <label id="circleControl" style="display:none">
-    Circles <input type="range" id="circleSlider" min="1" max="100" value="50">
+    Circles <input type="range" id="circleSlider" min="1" max="2000" value="50">
     <span class="slider-val" id="circleVal">50</span>
   </label>
   <label id="speedControl" style="display:none">
@@ -296,8 +296,10 @@ function enterDrawMode() {
   $('btnSpectrum').classList.remove('active');
 }
 
-function enterAnimMode(points) {
-  const resampled = resamplePath(points, 1024);
+function enterAnimMode(points, isImage) {
+  // More DFT points = more detail captured. Images need more than drawings.
+  const dftSize = isImage ? 4096 : 1024;
+  const resampled = resamplePath(points, dftSize);
   originalPath = resampled.slice();
   rawCoefficients = computeDFT(resampled);
   coefficients = rawCoefficients.slice();
@@ -307,8 +309,14 @@ function enterAnimMode(points) {
   trail = [];
   animPlaying = true;
 
-  numCircles = Math.min(Math.floor(coefficients.length / 2), 200);
-  showAnimControls(coefficients.length);
+  // Auto-estimate circle count: images need many more circles than drawings
+  const maxSlider = Math.min(coefficients.length, 2000);
+  if (isImage) {
+    numCircles = Math.min(Math.ceil(points.length / 3), maxSlider);
+  } else {
+    numCircles = Math.min(Math.floor(coefficients.length / 2), maxSlider);
+  }
+  showAnimControls(maxSlider);
   $('circleSlider').value = numCircles;
   $('circleVal').textContent = numCircles;
   $('btnDraw').classList.remove('active');
@@ -459,7 +467,7 @@ function loadImageFile(file) {
       const points = extractEdgePoints(img);
       $('processing').classList.add('hidden');
       if (points.length > 10) {
-        enterAnimMode(points);
+        enterAnimMode(points, true);
         $('btnUpload').classList.add('active');
         $('btnDraw').classList.remove('active');
       }
@@ -481,7 +489,7 @@ document.addEventListener('drop', e => {
 // ============================================================
 function extractEdgePoints(img) {
   // Draw image to offscreen canvas, scaled to fit
-  const maxDim = 400;
+  const maxDim = 600;
   const scale = Math.min(maxDim / img.width, maxDim / img.height, 1);
   const w = Math.round(img.width * scale);
   const h = Math.round(img.height * scale);
@@ -552,7 +560,7 @@ function extractEdgePoints(img) {
   const nonZeroMags = [];
   for (let i = 0; i < nms.length; i++) if (nms[i] > 0) nonZeroMags.push(nms[i]);
   nonZeroMags.sort((a, b) => a - b);
-  const highT = nonZeroMags.length > 0 ? nonZeroMags[Math.floor(nonZeroMags.length * 0.85)] : 1;
+  const highT = nonZeroMags.length > 0 ? nonZeroMags[Math.floor(nonZeroMags.length * 0.80)] : 1;
   const lowT = highT * 0.4;
 
   const edge = new Uint8Array(w * h);
@@ -567,13 +575,13 @@ function extractEdgePoints(img) {
     changed = false;
     for (let y = 1; y < h-1; y++) {
       for (let x = 1; x < w-1; x++) {
-        if (edge[y*w+x] === 1) {
-          for (let dy = -1; dy <= 1; dy++) {
-            for (let dx = -1; dx <= 1; dx++) {
-              if (edge[(y+dy)*w+x+dx] === 2) {
-                edge[y*w+x] = 2;
-                changed = true;
-              }
+        if (edge[y*w+x] !== 1) continue;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (edge[(y+dy)*w+x+dx] === 2) {
+              edge[y*w+x] = 2;
+              changed = true;
+              dy = 2; break;
             }
           }
         }
@@ -581,18 +589,129 @@ function extractEdgePoints(img) {
     }
   }
 
-  // Collect edge points
-  const edgePoints = [];
+  // Trace contours (follow connected edge pixels via 8-connectivity)
+  const visited = new Uint8Array(w * h);
+  const contours = [];
+  const dx8 = [-1, 0, 1, 1, 1, 0, -1, -1];
+  const dy8 = [-1, -1, -1, 0, 1, 1, 1, 0];
+
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      if (edge[y*w+x] === 2) edgePoints.push({ x, y });
+      if (edge[y*w+x] !== 2 || visited[y*w+x]) continue;
+      const contour = [];
+      let cx2 = x, cy2 = y;
+      while (true) {
+        visited[cy2 * w + cx2] = 1;
+        contour.push({ x: cx2, y: cy2 });
+        let found = false;
+        for (let d = 0; d < 8; d++) {
+          const nx = cx2 + dx8[d], ny = cy2 + dy8[d];
+          if (nx >= 0 && nx < w && ny >= 0 && ny < h &&
+              edge[ny*w+nx] === 2 && !visited[ny*w+nx]) {
+            cx2 = nx; cy2 = ny; found = true; break;
+          }
+        }
+        if (!found) break;
+      }
+      if (contour.length >= 2) contours.push(contour);
     }
   }
 
-  if (edgePoints.length === 0) return [];
+  // Merge nearby contour endpoints
+  const MERGE_R2 = 36; // 6px radius
+  let merged = contours.map(c => c.slice());
+  let didMerge = true;
+  while (didMerge) {
+    didMerge = false;
+    for (let i = 0; i < merged.length; i++) {
+      if (!merged[i]) continue;
+      const ci = merged[i];
+      for (let j = i + 1; j < merged.length; j++) {
+        if (!merged[j]) continue;
+        const cj = merged[j];
+        const pairs = [
+          [ci[ci.length-1], cj[0], () => ci.concat(cj)],
+          [ci[ci.length-1], cj[cj.length-1], () => ci.concat(cj.slice().reverse())],
+          [ci[0], cj[cj.length-1], () => cj.concat(ci)],
+          [ci[0], cj[0], () => cj.slice().reverse().concat(ci)],
+        ];
+        for (const [a, b, merge] of pairs) {
+          if (dist2(a, b) <= MERGE_R2) {
+            merged[i] = merge(); merged[j] = null; didMerge = true; break;
+          }
+        }
+        if (!merged[j]) break;
+      }
+    }
+    merged = merged.filter(Boolean);
+  }
 
-  // Order points: greedy nearest-neighbor
-  const ordered = orderPoints(edgePoints);
+  // Filter short contours and resample
+  let sigContours = merged.filter(c => c.length >= 8);
+  sigContours = sigContours.map(c => {
+    if (c.length <= 2) return c;
+    const result = [c[0]];
+    let acc = 0;
+    for (let i = 1; i < c.length; i++) {
+      acc += Math.sqrt(dist2(c[i], c[i-1]));
+      if (acc >= 2) { result.push(c[i]); acc = 0; }
+    }
+    if (result[result.length-1] !== c[c.length-1]) result.push(c[c.length-1]);
+    return result;
+  });
+
+  // Order contours: greedy nearest endpoint, start with longest
+  const used2 = new Uint8Array(sigContours.length);
+  const orderedContours = [];
+  let startIdx = 0;
+  for (let i = 1; i < sigContours.length; i++)
+    if (sigContours[i].length > sigContours[startIdx].length) startIdx = i;
+  used2[startIdx] = 1;
+  orderedContours.push(sigContours[startIdx]);
+
+  for (let i = 1; i < sigContours.length; i++) {
+    const tipC = orderedContours[orderedContours.length-1];
+    const tip = tipC[tipC.length-1];
+    let bestD = Infinity, bestJ = -1, bestFlip = false;
+    for (let j = 0; j < sigContours.length; j++) {
+      if (used2[j]) continue;
+      const c = sigContours[j];
+      const d1 = dist2(tip, c[0]);
+      const d2 = dist2(tip, c[c.length-1]);
+      if (d1 < bestD) { bestD = d1; bestJ = j; bestFlip = false; }
+      if (d2 < bestD) { bestD = d2; bestJ = j; bestFlip = true; }
+    }
+    used2[bestJ] = 1;
+    orderedContours.push(bestFlip ? sigContours[bestJ].slice().reverse() : sigContours[bestJ]);
+  }
+
+  // 2-opt on contour ordering to minimize connection distances
+  for (let pass = 0; pass < 5; pass++) {
+    let improved = false;
+    for (let i = 0; i < orderedContours.length - 1; i++) {
+      for (let j = i + 2; j < orderedContours.length; j++) {
+        const oc = orderedContours;
+        const oldCost = Math.sqrt(dist2(oc[i][oc[i].length-1], oc[i+1][0]))
+          + (j < oc.length-1 ? Math.sqrt(dist2(oc[j][oc[j].length-1], oc[j+1][0])) : 0);
+        const newCost = Math.sqrt(dist2(oc[i][oc[i].length-1], oc[j][oc[j].length-1]))
+          + (j < oc.length-1 ? Math.sqrt(dist2(oc[i+1][0], oc[j+1][0])) : 0);
+        if (newCost < oldCost - 0.5) {
+          const seg = oc.splice(i+1, j-i);
+          seg.reverse();
+          for (let k = 0; k < seg.length; k++) seg[k] = seg[k].slice().reverse();
+          oc.splice(i+1, 0, ...seg);
+          improved = true;
+        }
+      }
+    }
+    if (!improved) break;
+  }
+
+  // Flatten to single path
+  const finalPath = [];
+  for (const c of orderedContours) for (const p of c) finalPath.push(p);
+
+  if (finalPath.length === 0) return [];
 
   // Center and scale to screen
   const cx = window.innerWidth / 2;
@@ -601,88 +720,15 @@ function extractEdgePoints(img) {
   const ox = cx - (w * drawScale) / 2;
   const oy = cy - (h * drawScale) / 2;
 
-  return ordered.map(p => ({
+  return finalPath.map(p => ({
     x: ox + p.x * drawScale,
     y: oy + p.y * drawScale
   }));
 }
 
-// ============================================================
-// Path ordering (greedy nearest-neighbor)
-// ============================================================
-function orderPoints(points) {
-  const n = points.length;
-  if (n <= 2) return points;
-
-  // Subsample if too many points for O(n^2) greedy
-  let pts = points;
-  if (n > 3000) {
-    const step = Math.ceil(n / 3000);
-    pts = points.filter((_, i) => i % step === 0);
-  }
-
-  const used = new Uint8Array(pts.length);
-  const order = [0];
-  used[0] = 1;
-
-  for (let i = 1; i < pts.length; i++) {
-    const last = pts[order[order.length - 1]];
-    let bestD = Infinity, bestJ = 0;
-    for (let j = 0; j < pts.length; j++) {
-      if (used[j]) continue;
-      const dx = pts[j].x - last.x, dy = pts[j].y - last.y;
-      const d = dx*dx + dy*dy;
-      if (d < bestD) { bestD = d; bestJ = j; }
-    }
-    order.push(bestJ);
-    used[bestJ] = 1;
-  }
-
-  let result = order.map(i => pts[i]);
-
-  // 2-opt improvement
-  result = twoOpt(result);
-
-  return result;
-}
-
 function dist2(a, b) {
   const dx = a.x - b.x, dy = a.y - b.y;
   return dx * dx + dy * dy;
-}
-
-function twoOpt(path) {
-  const n = path.length;
-  if (n < 4) return path;
-  // Cap iterations for performance; for large paths, limit passes
-  const maxPasses = n > 1000 ? 3 : 10;
-  let improved = true;
-  let passes = 0;
-
-  while (improved && passes < maxPasses) {
-    improved = false;
-    passes++;
-    for (let i = 0; i < n - 2; i++) {
-      for (let j = i + 2; j < n - 1; j++) {
-        // Current edges: (i, i+1) and (j, j+1)
-        // Proposed: (i, j) and (i+1, j+1) -- reverse segment [i+1..j]
-        const d1 = dist2(path[i], path[i+1]) + dist2(path[j], path[j+1]);
-        const d2 = dist2(path[i], path[j]) + dist2(path[i+1], path[j+1]);
-        if (d2 < d1) {
-          // Reverse the segment between i+1 and j
-          let lo = i + 1, hi = j;
-          while (lo < hi) {
-            const tmp = path[lo];
-            path[lo] = path[hi];
-            path[hi] = tmp;
-            lo++; hi--;
-          }
-          improved = true;
-        }
-      }
-    }
-  }
-  return path;
 }
 
 // ============================================================
@@ -769,26 +815,6 @@ function computeDFT(points) {
 }
 
 let rawCoefficients = [];
-
-// ============================================================
-// Synthesize path from coefficients
-// ============================================================
-function synthesizePath(coeffs, n, numPoints) {
-  const points = [];
-  const useN = Math.min(n, coeffs.length);
-  for (let i = 0; i < numPoints; i++) {
-    const t = i / numPoints;
-    let x = 0, y = 0;
-    for (let j = 0; j < useN; j++) {
-      const c = coeffs[j];
-      const angle = 2 * Math.PI * c.freq * t + c.phase;
-      x += c.amp * Math.cos(angle);
-      y += c.amp * Math.sin(angle);
-    }
-    points.push({ x, y });
-  }
-  return points;
-}
 
 // ============================================================
 // Epicycle computation at time t
