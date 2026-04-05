@@ -191,8 +191,6 @@ const MAX_TRAIL = 4000;
 let trailFade = 50; // 0 = no fade (full opacity), 100 = oldest fully transparent
 let circleOpacity = 0.35;
 let showOverlay = false;
-let lossHistory = []; // reconstruction error per completed cycle
-let lastCycleTime = 0; // track cycle completions
 let showSpectrum = false;
 let originalPath = []; // resampled original path for comparison overlay
 let viewZoom = 1;
@@ -244,7 +242,7 @@ $('btnClear').addEventListener('click', () => enterDrawMode());
 $('circleSlider').addEventListener('input', e => {
   numCircles = parseInt(e.target.value);
   $('circleVal').textContent = numCircles;
-  trail = []; animTime = 0; lossHistory = []; lastCycleTime = 0;
+  trail = []; animTime = 0;
 });
 $('speedSlider').addEventListener('input', e => {
   // Logarithmic: 0->0.05, 500->0.5, 1000->10
@@ -300,8 +298,6 @@ function enterDrawMode() {
   showOverlay = false;
   showSpectrum = false;
   originalPath = [];
-  lossHistory = [];
-  lastCycleTime = 0;
   viewZoom = 1;
   hideAnimControls();
   $('prompt').classList.remove('hidden');
@@ -894,28 +890,8 @@ function render(timestamp) {
       const step = 1 / 4096; // fixed resolution matching DFT
       const stepsPerFrame = Math.max(1, Math.round(dt * roundsPerSec * 4096));
       for (let s = 0; s < stepsPerFrame; s++) {
-        const prevTime = animTime;
         animTime += step;
-        if (animTime >= 1) {
-          animTime -= 1;
-          // Cycle completed -- compute reconstruction loss
-          if (originalPath.length > 1 && trail.length > 10) {
-            let totalErr = 0, samples = 0;
-            const trailStep = Math.max(1, Math.floor(trail.length / 200));
-            const origStep = Math.max(1, Math.floor(originalPath.length / 200));
-            for (let ti = 0; ti < trail.length; ti += trailStep) {
-              let minD = Infinity;
-              for (let oi = 0; oi < originalPath.length; oi += origStep) {
-                const d = dist2(trail[ti], originalPath[oi]);
-                if (d < minD) minD = d;
-              }
-              totalErr += Math.sqrt(minD);
-              samples++;
-            }
-            if (samples > 0) lossHistory.push(totalErr / samples);
-            if (lossHistory.length > 50) lossHistory.shift();
-          }
-        }
+        if (animTime >= 1) animTime -= 1;
         const tip = computeEpicycles(animTime, numCircles);
         trail.push({ x: tip.tipX, y: tip.tipY });
         if (trail.length > MAX_TRAIL) trail.shift();
@@ -1044,42 +1020,8 @@ function render(timestamp) {
       ctx.fillText('amp', sx + specW - 20, sy + 8);
     }
 
-    // Loss chart (bottom-right, above spectrum if visible)
-    if (lossHistory.length > 1) {
-      const lw = 160, lh = 80, lpad = 12;
-      const lx = window.innerWidth - lw - lpad;
-      const specOffset = (showSpectrum && coefficients.length > 0) ? 140 : 0;
-      const ly = window.innerHeight - lh - lpad - 20 - specOffset;
-
-      ctx.fillStyle = 'rgba(10, 10, 10, 0.85)';
-      ctx.fillRect(lx - 4, ly - 4, lw + 8, lh + 8);
-      ctx.strokeStyle = '#222';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(lx - 4, ly - 4, lw + 8, lh + 8);
-
-      const maxLoss = Math.max(...lossHistory);
-      const minLoss = Math.min(...lossHistory);
-      const range = maxLoss - minLoss || 1;
-
-      ctx.beginPath();
-      for (let i = 0; i < lossHistory.length; i++) {
-        const px = lx + (i / (lossHistory.length - 1)) * lw;
-        const py = ly + lh - 4 - ((lossHistory[i] - minLoss) / range) * (lh - 10);
-        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-      }
-      ctx.strokeStyle = '#ff6b6b';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-
-      ctx.fillStyle = '#555';
-      ctx.font = '9px monospace';
-      ctx.fillText('loss', lx + 2, ly + 10);
-      ctx.fillText(lossHistory[lossHistory.length-1].toFixed(1) + 'px', lx + lw - 40, ly + 10);
-    }
-
     // Info
-    const lossStr = lossHistory.length > 0 ? `  |  loss: ${lossHistory[lossHistory.length-1].toFixed(1)}px` : '';
-    $('info').textContent = `circles: ${Math.min(numCircles, coefficients.length)} / ${coefficients.length}  |  t: ${animTime.toFixed(3)}${lossStr}`;
+    $('info').textContent = `circles: ${Math.min(numCircles, coefficients.length)} / ${coefficients.length}  |  t: ${animTime.toFixed(3)}`;
   }
 
   requestAnimationFrame(render);
