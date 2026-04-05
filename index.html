@@ -873,9 +873,19 @@ function render(timestamp) {
   }
 
   if (mode === 'animate' && coefficients.length > 0) {
+    // Decouple trail computation from frame rate:
+    // Fixed step size ensures the trail traces the shape faithfully.
+    // Speed controls how many steps we take per frame, not step size.
     if (animPlaying) {
-      animTime += dt * (animSpeed / 50);
-      if (animTime >= 1) animTime -= 1;
+      const step = 1 / 4096; // fixed resolution matching DFT
+      const stepsPerFrame = Math.max(1, Math.round(dt * animSpeed * 2));
+      for (let s = 0; s < stepsPerFrame; s++) {
+        animTime += step;
+        if (animTime >= 1) animTime -= 1;
+        const tip = computeEpicycles(animTime, numCircles);
+        trail.push({ x: tip.tipX, y: tip.tipY });
+        if (trail.length > MAX_TRAIL) trail.shift();
+      }
     }
 
     const { circles, tipX, tipY } = computeEpicycles(animTime, numCircles);
@@ -922,11 +932,6 @@ function render(timestamp) {
     }
 
     // Trail
-    if (animPlaying) {
-      trail.push({ x: tipX, y: tipY });
-      if (trail.length > MAX_TRAIL) trail.shift();
-    }
-
     if (trail.length > 1) {
       // minAlpha: fade=0 -> 1.0 (no fade), fade=100 -> 0 (oldest invisible)
       // Tip (newest) is always 1.0 alpha
