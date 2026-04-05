@@ -21,6 +21,7 @@ body {
 canvas {
   position: absolute;
   top: 0; left: 0;
+  touch-action: none;
 }
 
 #controls {
@@ -57,11 +58,12 @@ canvas {
   background: #1a1a1a;
   color: #ccc;
   border: 1px solid #333;
-  padding: 5px 10px;
+  padding: 6px 10px;
   border-radius: 4px;
   cursor: pointer;
   font-family: inherit;
   font-size: 12px;
+  min-height: 32px;
 }
 #controls button:hover { background: #252525; border-color: #444; }
 #controls button.active { background: #1a3a5c; border-color: #4a9eff; color: #4a9eff; }
@@ -93,6 +95,7 @@ canvas {
   line-height: 1.6;
 }
 #prompt.hidden { display: none; }
+.hidden { display: none; }
 
 .slider-val {
   min-width: 28px;
@@ -132,14 +135,28 @@ canvas {
     Optim <input type="range" id="optimSlider" min="0" max="1000" value="0" step="10">
     <span class="slider-val" id="optimVal">0</span>
   </label>
+  <div class="btn-row" id="presetRow">
+    <select id="presetSelect" style="flex:1;background:#1a1a1a;color:#ccc;border:1px solid #333;border-radius:4px;padding:5px;font-family:inherit;font-size:12px;min-height:32px">
+      <option value="">Presets...</option>
+      <option value="square">Square</option>
+      <option value="star">Star</option>
+      <option value="heart">Heart</option>
+      <option value="infinity">Infinity</option>
+    </select>
+  </div>
+  <button id="btnSpectrum" style="display:none">Spectrum</button>
+  <button id="btnOverlay" style="display:none">Show Original</button>
+  <button id="btnCopyLink" style="display:none">Copy Link</button>
   <button id="btnClear" style="display:none">Clear</button>
 </div>
 
 <div id="prompt">Draw something</div>
+<div id="processing" class="hidden" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#4a9eff;font-size:14px;z-index:20;pointer-events:none"></div>
 <div id="info"></div>
 
 <input type="file" id="fileInput" accept="image/*" style="display:none">
 
+<script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
 <script>
 // ============================================================
 // Canvas setup
@@ -172,6 +189,12 @@ let animPlaying = false;
 let trail = [];
 const MAX_TRAIL = 4000;
 let trailFade = 80; // 0 = no fade (full trail), 100 = instant vanish
+let showOverlay = false;
+let showSpectrum = false;
+let originalPath = []; // resampled original path for comparison overlay
+let viewZoom = 1;
+let viewPanX = 0, viewPanY = 0;
+let pinchDist0 = 0; // initial pinch distance
 
 // ============================================================
 // UI wiring
@@ -185,6 +208,34 @@ $('fileInput').addEventListener('change', handleFileUpload);
 $('btnPlay').addEventListener('click', () => { animPlaying = true; });
 $('btnPause').addEventListener('click', () => { animPlaying = false; });
 $('btnReset').addEventListener('click', () => { animTime = 0; trail = []; });
+$('btnSpectrum').addEventListener('click', () => {
+  showSpectrum = !showSpectrum;
+  $('btnSpectrum').classList.toggle('active', showSpectrum);
+});
+$('btnOverlay').addEventListener('click', () => {
+  showOverlay = !showOverlay;
+  $('btnOverlay').textContent = showOverlay ? 'Hide Original' : 'Show Original';
+  $('btnOverlay').classList.toggle('active', showOverlay);
+});
+$('btnCopyLink').addEventListener('click', () => {
+  if (coefficients.length === 0) return;
+  const active = coefficients.slice(0, Math.min(numCircles, coefficients.length));
+  let url;
+  if (active.length <= 20) {
+    // Human-readable for small counts
+    const parts = active.map(c =>
+      `${c.freq}:${c.amp.toFixed(2)}:${c.phase.toFixed(4)}`
+    );
+    url = location.origin + location.pathname + '#h=' + parts.join(',');
+  } else {
+    // Binary compressed
+    url = location.origin + location.pathname + '#c=' + encodeCoefficients(active);
+  }
+  navigator.clipboard.writeText(url).then(() => {
+    $('btnCopyLink').textContent = 'Copied!';
+    setTimeout(() => { $('btnCopyLink').textContent = 'Copy Link'; }, 1500);
+  });
+});
 $('btnClear').addEventListener('click', () => enterDrawMode());
 
 $('circleSlider').addEventListener('input', e => {
@@ -203,7 +254,17 @@ $('fadeSlider').addEventListener('input', e => {
 $('optimSlider').addEventListener('input', e => {
   $('optimVal').textContent = e.target.value;
   if (coefficients.length > 0) {
-    runOptimization(parseInt(e.target.value));
+    const target = parseInt(e.target.value);
+    if (target > 100) {
+      $('processing').textContent = 'Optimizing...';
+      $('processing').classList.remove('hidden');
+      setTimeout(() => {
+        runOptimization(target);
+        $('processing').classList.add('hidden');
+      }, 20);
+    } else {
+      runOptimization(target);
+    }
   }
 });
 
@@ -217,6 +278,9 @@ function showAnimControls(maxCircles) {
   $('speedControl').style.display = '';
   $('fadeControl').style.display = '';
   $('optimControl').style.display = '';
+  $('btnSpectrum').style.display = '';
+  $('btnOverlay').style.display = '';
+  $('btnCopyLink').style.display = '';
   $('btnClear').style.display = '';
   $('prompt').classList.add('hidden');
 }
@@ -227,6 +291,9 @@ function hideAnimControls() {
   $('speedControl').style.display = 'none';
   $('fadeControl').style.display = 'none';
   $('optimControl').style.display = 'none';
+  $('btnSpectrum').style.display = 'none';
+  $('btnOverlay').style.display = 'none';
+  $('btnCopyLink').style.display = 'none';
   $('btnClear').style.display = 'none';
 }
 
@@ -237,17 +304,25 @@ function enterDrawMode() {
   trail = [];
   animTime = 0;
   animPlaying = false;
+  showOverlay = false;
+  showSpectrum = false;
+  originalPath = [];
+  viewZoom = 1;
   hideAnimControls();
   $('prompt').classList.remove('hidden');
   $('prompt').textContent = 'Draw something';
   $('btnDraw').classList.add('active');
   $('btnUpload').classList.remove('active');
+  $('btnOverlay').textContent = 'Show Original';
+  $('btnOverlay').classList.remove('active');
+  $('btnSpectrum').classList.remove('active');
   $('optimSlider').value = 0;
   $('optimVal').textContent = '0';
 }
 
 function enterAnimMode(points) {
   const resampled = resamplePath(points, 1024);
+  originalPath = resampled.slice();
   rawCoefficients = computeDFT(resampled);
   coefficients = rawCoefficients.slice();
   optimIterations = 0;
@@ -288,24 +363,143 @@ canvas.addEventListener('pointerup', () => {
   }
 });
 
+// Pinch-to-zoom and scroll-to-zoom
+canvas.addEventListener('wheel', e => {
+  if (mode !== 'animate') return;
+  e.preventDefault();
+  const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+  viewZoom = Math.max(0.1, Math.min(10, viewZoom * zoomFactor));
+}, { passive: false });
+
+canvas.addEventListener('touchstart', e => {
+  if (e.touches.length === 2 && mode === 'animate') {
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    pinchDist0 = Math.sqrt(dx * dx + dy * dy);
+  }
+}, { passive: true });
+
+canvas.addEventListener('touchmove', e => {
+  if (e.touches.length === 2 && mode === 'animate' && pinchDist0 > 0) {
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    viewZoom = Math.max(0.1, Math.min(10, viewZoom * (dist / pinchDist0)));
+    pinchDist0 = dist;
+  }
+}, { passive: true });
+
+// ============================================================
+// Presets
+// ============================================================
+$('presetSelect').addEventListener('change', e => {
+  const shape = e.target.value;
+  if (!shape) return;
+  const points = generatePreset(shape);
+  if (points.length > 10) enterAnimMode(points);
+  e.target.value = '';
+});
+
+function generatePreset(name) {
+  const cx = window.innerWidth / 2, cy = window.innerHeight / 2;
+  const r = Math.min(window.innerWidth, window.innerHeight) * 0.25;
+  const n = 512;
+  const pts = [];
+
+  if (name === 'square') {
+    const sides = [
+      (t) => ({ x: cx - r + 2*r*t, y: cy - r }),
+      (t) => ({ x: cx + r, y: cy - r + 2*r*t }),
+      (t) => ({ x: cx + r - 2*r*t, y: cy + r }),
+      (t) => ({ x: cx - r, y: cy + r - 2*r*t })
+    ];
+    const perSide = Math.floor(n / 4);
+    for (let s = 0; s < 4; s++) {
+      for (let i = 0; i < perSide; i++) {
+        pts.push(sides[s](i / perSide));
+      }
+    }
+  } else if (name === 'star') {
+    for (let i = 0; i < n; i++) {
+      const angle = (i / n) * 2 * Math.PI - Math.PI / 2;
+      const spoke = i % 2 === 0 ? r : r * 0.4;
+      // 5-pointed star: alternate between outer and inner radius
+      const starAngle = (Math.floor(i / (n / 10)) / 10) * 2 * Math.PI - Math.PI / 2;
+      const frac = (i % (n / 10)) / (n / 10);
+      const a1 = (Math.floor(i / (n / 10)) / 10) * 2 * Math.PI - Math.PI / 2;
+      const nextPt = (Math.floor(i / (n / 10)) + 1) % 10;
+      const a2 = (nextPt / 10) * 2 * Math.PI - Math.PI / 2;
+      const r1 = Math.floor(i / (n / 10)) % 2 === 0 ? r : r * 0.4;
+      const r2 = nextPt % 2 === 0 ? r : r * 0.4;
+      pts.push({
+        x: cx + (r1 * Math.cos(a1) * (1 - frac) + r2 * Math.cos(a2) * frac),
+        y: cy + (r1 * Math.sin(a1) * (1 - frac) + r2 * Math.sin(a2) * frac)
+      });
+    }
+  } else if (name === 'heart') {
+    for (let i = 0; i < n; i++) {
+      const t = (i / n) * 2 * Math.PI;
+      const hx = 16 * Math.pow(Math.sin(t), 3);
+      const hy = -(13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t));
+      pts.push({ x: cx + hx * r / 17, y: cy + hy * r / 17 });
+    }
+  } else if (name === 'infinity') {
+    for (let i = 0; i < n; i++) {
+      const t = (i / n) * 2 * Math.PI;
+      // Lemniscate of Bernoulli
+      const s = Math.cos(2 * t);
+      if (s < 0) {
+        // Mirror for full figure-8
+        const t2 = t + Math.PI;
+        const s2 = Math.cos(2 * t2);
+        const rr = s2 > 0 ? Math.sqrt(s2) : 0;
+        pts.push({ x: cx - rr * Math.cos(t2) * r, y: cy + rr * Math.sin(t2) * r * 0.6 });
+      } else {
+        const rr = Math.sqrt(s);
+        pts.push({ x: cx + rr * Math.cos(t) * r, y: cy + rr * Math.sin(t) * r * 0.6 });
+      }
+    }
+  }
+  return pts;
+}
+
 // ============================================================
 // Image upload
 // ============================================================
 function handleFileUpload(e) {
   const file = e.target.files[0];
   if (!file) return;
-  const img = new Image();
-  img.onload = () => {
-    const points = extractEdgePoints(img);
-    if (points.length > 10) {
-      enterAnimMode(points);
-      $('btnUpload').classList.add('active');
-      $('btnDraw').classList.remove('active');
-    }
-  };
-  img.src = URL.createObjectURL(file);
+  loadImageFile(file);
   e.target.value = '';
 }
+
+function loadImageFile(file) {
+  if (!file.type.startsWith('image/')) return;
+  const img = new Image();
+  img.onload = () => {
+    $('processing').textContent = 'Detecting edges...';
+    $('processing').classList.remove('hidden');
+    // Defer so the status message renders before blocking work
+    setTimeout(() => {
+      const points = extractEdgePoints(img);
+      $('processing').classList.add('hidden');
+      if (points.length > 10) {
+        enterAnimMode(points);
+        $('btnUpload').classList.add('active');
+        $('btnDraw').classList.remove('active');
+      }
+    }, 20);
+  };
+  img.src = URL.createObjectURL(file);
+}
+
+// Drag-drop
+document.addEventListener('dragover', e => { e.preventDefault(); });
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  const file = e.dataTransfer.files[0];
+  if (file) loadImageFile(file);
+});
 
 // ============================================================
 // Edge detection (Canny-lite)
@@ -467,7 +661,51 @@ function orderPoints(points) {
     used[bestJ] = 1;
   }
 
-  return order.map(i => pts[i]);
+  let result = order.map(i => pts[i]);
+
+  // 2-opt improvement
+  result = twoOpt(result);
+
+  return result;
+}
+
+function dist2(a, b) {
+  const dx = a.x - b.x, dy = a.y - b.y;
+  return dx * dx + dy * dy;
+}
+
+function twoOpt(path) {
+  const n = path.length;
+  if (n < 4) return path;
+  // Cap iterations for performance; for large paths, limit passes
+  const maxPasses = n > 1000 ? 3 : 10;
+  let improved = true;
+  let passes = 0;
+
+  while (improved && passes < maxPasses) {
+    improved = false;
+    passes++;
+    for (let i = 0; i < n - 2; i++) {
+      for (let j = i + 2; j < n - 1; j++) {
+        // Current edges: (i, i+1) and (j, j+1)
+        // Proposed: (i, j) and (i+1, j+1) -- reverse segment [i+1..j]
+        const d1 = dist2(path[i], path[i+1]) + dist2(path[j], path[j+1]);
+        const d2 = dist2(path[i], path[j]) + dist2(path[i+1], path[j+1]);
+        if (d2 < d1) {
+          // Reverse the segment between i+1 and j
+          let lo = i + 1, hi = j;
+          while (lo < hi) {
+            const tmp = path[lo];
+            path[lo] = path[hi];
+            path[hi] = tmp;
+            lo++; hi--;
+          }
+          improved = true;
+        }
+      }
+    }
+  }
+  return path;
 }
 
 // ============================================================
@@ -619,6 +857,34 @@ function runOptimization(targetIter) {
       c.im = c.amp * Math.sin(c.phase);
     }
 
+    // Frequency swapping every 50 iterations: try replacing weakest active
+    // coefficient with an unused frequency from the full set
+    if ((optimIterations + iter + 1) % 50 === 0 && active.length > 2) {
+      const currentErr = chamferError(current, targetPoints);
+      // Find weakest active coefficient (skip DC term at freq 0)
+      let weakIdx = -1, weakAmp = Infinity;
+      for (let ci = 0; ci < active.length; ci++) {
+        if (active[ci].freq === 0) continue;
+        if (active[ci].amp < weakAmp) { weakAmp = active[ci].amp; weakIdx = ci; }
+      }
+      if (weakIdx >= 0) {
+        // Find unused frequencies
+        const activeFreqs = new Set(active.map(c => c.freq));
+        const candidates = rawCoefficients.filter(c => !activeFreqs.has(c.freq));
+        // Try top 5 unused by raw amplitude
+        const topCandidates = candidates.slice(0, 5);
+        let bestSwap = null, bestErr = currentErr;
+        const saved = active[weakIdx];
+        for (const cand of topCandidates) {
+          active[weakIdx] = { ...cand };
+          const trial = synthesizePath(active, active.length, N);
+          const err = chamferError(trial, targetPoints);
+          if (err < bestErr) { bestErr = err; bestSwap = { ...cand }; }
+        }
+        active[weakIdx] = bestSwap || saved;
+      }
+    }
+
     // Write back
     for (let i = 0; i < active.length; i++) {
       coefficients[i] = active[i];
@@ -628,6 +894,20 @@ function runOptimization(targetIter) {
   optimIterations = targetIter;
   trail = [];
   animTime = 0;
+}
+
+function chamferError(pathA, pathB) {
+  let total = 0;
+  for (let i = 0; i < pathA.length; i++) {
+    let minD = Infinity;
+    for (let j = 0; j < pathB.length; j++) {
+      const dx = pathA[i].x - pathB[j].x, dy = pathA[i].y - pathB[j].y;
+      const d = dx * dx + dy * dy;
+      if (d < minD) minD = d;
+    }
+    total += minD;
+  }
+  return total;
 }
 
 // ============================================================
@@ -714,6 +994,13 @@ function render(timestamp) {
 
     const { circles, tipX, tipY } = computeEpicycles(animTime, numCircles);
 
+    // Apply zoom transform (zoom around screen center)
+    ctx.save();
+    const zcx = window.innerWidth / 2, zcy = window.innerHeight / 2;
+    ctx.translate(zcx, zcy);
+    ctx.scale(viewZoom, viewZoom);
+    ctx.translate(-zcx, -zcy);
+
     // Draw circles
     ctx.globalAlpha = 0.25;
     for (const c of circles) {
@@ -732,6 +1019,21 @@ function render(timestamp) {
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
+
+    // Original path overlay
+    if (showOverlay && originalPath.length > 1) {
+      ctx.globalAlpha = 0.3;
+      ctx.beginPath();
+      ctx.moveTo(originalPath[0].x, originalPath[0].y);
+      for (let i = 1; i < originalPath.length; i++) {
+        ctx.lineTo(originalPath[i].x, originalPath[i].y);
+      }
+      ctx.closePath();
+      ctx.strokeStyle = '#ff4a4a';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
 
     // Trail
     if (animPlaying) {
@@ -786,6 +1088,39 @@ function render(timestamp) {
     ctx.fillStyle = '#fff';
     ctx.fill();
 
+    ctx.restore(); // end zoom transform
+
+    // Spectrum view
+    if (showSpectrum && coefficients.length > 0) {
+      const specW = 240, specH = 120, pad = 12;
+      const sx = window.innerWidth - specW - pad;
+      const sy = window.innerHeight - specH - pad - 20;
+
+      ctx.fillStyle = 'rgba(10, 10, 10, 0.85)';
+      ctx.fillRect(sx - 4, sy - 4, specW + 8, specH + 8);
+      ctx.strokeStyle = '#222';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(sx - 4, sy - 4, specW + 8, specH + 8);
+
+      const n = Math.min(numCircles, coefficients.length);
+      const sorted = coefficients.slice(0, n).slice().sort((a, b) => a.freq - b.freq);
+      const maxAmp = sorted.reduce((m, c) => Math.max(m, c.amp), 0.001);
+      const barW = Math.max(1, (specW - 2) / sorted.length);
+
+      for (let i = 0; i < sorted.length; i++) {
+        const h = (sorted[i].amp / maxAmp) * (specH - 14);
+        const bx = sx + 1 + i * barW;
+        const by = sy + specH - 2 - h;
+        ctx.fillStyle = '#4a9eff';
+        ctx.fillRect(bx, by, Math.max(1, barW - 1), h);
+      }
+
+      ctx.fillStyle = '#555';
+      ctx.font = '9px monospace';
+      ctx.fillText('freq', sx + 2, sy + specH + 0);
+      ctx.fillText('amp', sx + specW - 20, sy + 8);
+    }
+
     // Info
     $('info').textContent = `circles: ${Math.min(numCircles, coefficients.length)} / ${coefficients.length}  |  t: ${animTime.toFixed(3)}  |  optim: ${optimIterations}`;
   }
@@ -796,8 +1131,120 @@ function render(timestamp) {
 requestAnimationFrame(render);
 
 // ============================================================
-// URL hash: decode coefficients on load
+// URL hash: encode/decode coefficients
 // ============================================================
+
+// Binary encoding: for each coefficient, pack freq (zigzag varint),
+// amplitude (float16, 2 bytes), phase (uint16 mapped to [0, 2pi), 2 bytes)
+// Then pako deflate and base64url encode.
+
+function zigzagEncode(n) { return (n << 1) ^ (n >> 31); }
+function zigzagDecode(n) { return (n >>> 1) ^ -(n & 1); }
+
+function writeVarint(bytes, val) {
+  val = val >>> 0;
+  while (val > 0x7f) { bytes.push((val & 0x7f) | 0x80); val >>>= 7; }
+  bytes.push(val & 0x7f);
+}
+
+function readVarint(bytes, offset) {
+  let val = 0, shift = 0, b;
+  do {
+    b = bytes[offset.pos++];
+    val |= (b & 0x7f) << shift;
+    shift += 7;
+  } while (b & 0x80);
+  return val;
+}
+
+// Float16 encode/decode (IEEE 754 half precision)
+function toFloat16(val) {
+  const buf = new ArrayBuffer(4);
+  new Float32Array(buf)[0] = val;
+  const f32 = new Uint32Array(buf)[0];
+  const sign = (f32 >> 16) & 0x8000;
+  const exp = ((f32 >> 23) & 0xff) - 127 + 15;
+  const frac = (f32 >> 13) & 0x3ff;
+  if (exp <= 0) return sign; // underflow to zero
+  if (exp >= 31) return sign | 0x7c00; // overflow to inf
+  return sign | (exp << 10) | frac;
+}
+
+function fromFloat16(h) {
+  const sign = (h & 0x8000) >> 15;
+  const exp = (h & 0x7c00) >> 10;
+  const frac = h & 0x03ff;
+  if (exp === 0) return (sign ? -1 : 1) * (frac / 1024) * Math.pow(2, -14);
+  if (exp === 31) return frac ? NaN : (sign ? -Infinity : Infinity);
+  return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + frac / 1024);
+}
+
+// Base64url encode/decode
+function base64urlEncode(uint8) {
+  let s = '';
+  for (let i = 0; i < uint8.length; i++) s += String.fromCharCode(uint8[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64urlDecode(str) {
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  const bin = atob(str);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function encodeCoefficients(coeffs) {
+  const bytes = [];
+  for (const c of coeffs) {
+    writeVarint(bytes, zigzagEncode(c.freq));
+    const a16 = toFloat16(c.amp);
+    bytes.push(a16 & 0xff, (a16 >> 8) & 0xff);
+    const p16 = Math.round(((c.phase % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI)) / (2 * Math.PI) * 65535);
+    bytes.push(p16 & 0xff, (p16 >> 8) & 0xff);
+  }
+  const compressed = pako.deflate(new Uint8Array(bytes));
+  return base64urlEncode(compressed);
+}
+
+function decodeCoefficients(str) {
+  const compressed = base64urlDecode(str);
+  const bytes = pako.inflate(compressed);
+  const coeffs = [];
+  const offset = { pos: 0 };
+  while (offset.pos < bytes.length) {
+    const freq = zigzagDecode(readVarint(bytes, offset));
+    if (offset.pos + 4 > bytes.length) break;
+    const a16 = bytes[offset.pos] | (bytes[offset.pos + 1] << 8);
+    offset.pos += 2;
+    const p16 = bytes[offset.pos] | (bytes[offset.pos + 1] << 8);
+    offset.pos += 2;
+    const amp = fromFloat16(a16);
+    const phase = (p16 / 65535) * 2 * Math.PI;
+    coeffs.push({
+      freq, amp, phase,
+      re: amp * Math.cos(phase),
+      im: amp * Math.sin(phase)
+    });
+  }
+  return coeffs;
+}
+
+function loadCoefficients(coeffs) {
+  if (coeffs.length === 0) return;
+  coefficients = coeffs;
+  rawCoefficients = coeffs.map(c => ({ ...c }));
+  optimIterations = 0;
+  mode = 'animate';
+  animTime = 0;
+  trail = [];
+  animPlaying = true;
+  drawingPoints = [{ x: window.innerWidth / 2, y: window.innerHeight / 2 }];
+  numCircles = coefficients.length;
+  showAnimControls(coefficients.length);
+}
+
 function tryLoadFromHash() {
   const hash = location.hash.slice(1);
   if (!hash) return;
@@ -812,22 +1259,18 @@ function tryLoadFromHash() {
         re: a * Math.cos(p), im: a * Math.sin(p)
       };
     }).filter(c => !isNaN(c.freq));
+    loadCoefficients(coeffs);
+  }
 
-    if (coeffs.length > 0) {
-      coefficients = coeffs;
-      rawCoefficients = coeffs.map(c => ({ ...c }));
-      optimIterations = 0;
-      mode = 'animate';
-      animTime = 0;
-      trail = [];
-      animPlaying = true;
-      // Fake center to screen center
-      drawingPoints = [{ x: window.innerWidth/2, y: window.innerHeight/2 }];
-      numCircles = coefficients.length;
-      showAnimControls(coefficients.length);
+  // Binary compressed: c=<base64url pako-compressed>
+  if (hash.startsWith('c=')) {
+    try {
+      const coeffs = decodeCoefficients(hash.slice(2));
+      loadCoefficients(coeffs);
+    } catch (e) {
+      console.error('Failed to decode coefficients from URL:', e);
     }
   }
-  // TODO: compressed binary format c=...
 }
 
 tryLoadFromHash();
